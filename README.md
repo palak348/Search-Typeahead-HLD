@@ -56,35 +56,99 @@ Then open <http://127.0.0.1:8000>. Interactive API docs are auto-generated at
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    UI(["Browser / static UI"])
+    DB[("SQLite — queries table<br/>durable source of truth")]
+
+    subgraph APP["FastAPI application"]
+        direction TB
+        NORM["normalize<br/>trim + lowercase"]
+        RING{{"consistent-hash ring<br/>150 virtual nodes per node"}}
+
+        subgraph CACHE["Distributed cache — TTL + LRU per node"]
+            direction LR
+            C0[("cache-node-0")]
+            C1[("cache-node-1")]
+            C2[("cache-node-2")]
+        end
+
+        RANK["rank suggestions<br/>popularity + recency boost"]
+        TRIE[["Prefix Trie<br/>top-N cached at each node"]]
+        SH["/search handler"]
+        BW["BatchWriter<br/>buffer · flush by size/time"]
+    end
+
+    %% read path (bold) — GET /suggest
+    UI ==>|"GET /suggest?q="| NORM
+    NORM ==> RING
+    RING ==>|"route key to owner node"| CACHE
+    CACHE ==>|"HIT: cached top-10"| UI
+    CACHE -->|"MISS"| RANK
+    RANK -->|"read top-N"| TRIE
+    RANK -.->|"populate owner node"| CACHE
+    RANK ==>|"return suggestions"| UI
+
+    %% write path — POST /search
+    UI -->|"POST /search"| SH
+    SH --> TREND["trending.record()"]
+    SH --> INC["trie.increment() — live"]
+    SH --> ADD["batch_writer.add()"]
+    SH --> INVAL["cache.invalidate_prefixes()"]
+    INC --> TRIE
+    ADD --> BW
+    INVAL --> CACHE
+    BW -->|"aggregated upsert"| DB
+
+    %% startup
+    DB -.->|"rebuilt on startup"| TRIE
+
+    classDef read fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+    classDef write fill:#fff3e0,stroke:#e65100,color:#3e2723;
+    classDef store fill:#ede7f6,stroke:#4527a0,color:#1a1035;
+    class NORM,RING,RANK read;
+    class SH,TREND,INC,ADD,INVAL,BW write;
+    class TRIE,DB,C0,C1,C2 store;
 ```
-   Browser (static UI)
-        |
-        v
-  +--------------------------------------------------------------+
-  |                        FastAPI app                           |
-  |                                                              |
-  |  GET /suggest  --> normalize --> DistributedCache.get(prefix)|
-  |                                      |                       |
-  |                          +-----------+-----------+           |
-  |                          |  consistent-hash ring |           |
-  |                          v           v           v           |
-  |                    [cache-node-0][cache-node-1][cache-node-2]|  TTL + LRU
-  |                          | miss (compute + populate node)    |  per node
-  |                          v                                    |
-  |                     Prefix Trie  <-- rebuilt on startup --+   |
-  |                     (top-N cached per node)               |   |
-  |                                                           |   |
-  |  POST /search --> trending.record()  (recent-activity)    |   |
-  |                   trie.increment()   (live, in-memory)    |   |
-  |                   batch_writer.add()  --> buffer --+       |   |
-  |                   cache.invalidate_prefixes()      |       |   |
-  |                                                    v       |   |
-  |                                  BatchWriter (flush by size/time)
-  |                                                    |           |
-  |                                                    v           |
-  |                                          SQLite (queries) -----+
-  +--------------------------------------------------------------+
+
+**Legend:** **bold arrows** = the hot read path (`GET /suggest`); thin arrows =
+the write path (`POST /search`); dotted arrows = asynchronous / startup work
+(cache population, batch flush, trie rebuild). Blue = read-path logic,
+orange = write-path logic, purple = storage.
+
+**Read (`/suggest`):** normalize → ring routes the prefix to its owning cache
+node → **hit** returns the cached top-10; **miss** ranks from the trie, populates
+that node, and returns.
+
+**Write (`/search`):** the handler bumps the trending score, increments the trie
+*live* (so suggestions are instantly fresh), buffers the durable count for the
+next batch flush, and invalidates the affected prefixes in the cache.
+
+<details>
+<summary>Plain-text version (for editors without Mermaid)</summary>
+
 ```
+                         Browser / static UI
+              GET /suggest |                 ^  suggestions
+                           v                 |
+   normalize -> consistent-hash ring -> [node-0 | node-1 | node-2]   (TTL + LRU)
+                                              | hit -> return cached top-10
+                                              | miss
+                                              v
+                                     rank (popularity + recency)
+                                              | reads
+                                              v
+                                     Prefix Trie (top-N per node)
+                                              ^
+                          POST /search        | live increment
+   Browser ---------------> /search handler ---+--> trending.record()
+                                              |--> batch_writer.add() -> buffer
+                                              |        -> flush (size/time) -> SQLite
+                                              |--> cache.invalidate_prefixes()
+                                              |
+                       SQLite --- rebuilt on startup ---> Prefix Trie
+```
+</details>
 
 **Module map** (`app/`):
 
