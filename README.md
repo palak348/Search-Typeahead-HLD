@@ -56,99 +56,59 @@ Then open <http://127.0.0.1:8000>. Interactive API docs are auto-generated at
 
 ## Architecture
 
+The system has two paths: a fast **read path** (`GET /suggest`) served from cache
+or an in-memory trie, and a **write path** (`POST /search`) that updates rankings
+in memory and defers the durable write to a background batch writer.
+
+### Read path — `GET /suggest`
+
 ```mermaid
-flowchart TB
-    UI(["Browser / static UI"])
-    DB[("SQLite — queries table<br/>durable source of truth")]
-
-    subgraph APP["FastAPI application"]
-        direction TB
-        NORM["normalize<br/>trim + lowercase"]
-        RING{{"consistent-hash ring<br/>150 virtual nodes per node"}}
-
-        subgraph CACHE["Distributed cache — TTL + LRU per node"]
-            direction LR
-            C0[("cache-node-0")]
-            C1[("cache-node-1")]
-            C2[("cache-node-2")]
-        end
-
-        RANK["rank suggestions<br/>popularity + recency boost"]
-        TRIE[["Prefix Trie<br/>top-N cached at each node"]]
-        SH["/search handler"]
-        BW["BatchWriter<br/>buffer · flush by size/time"]
-    end
-
-    %% read path (bold) — GET /suggest
-    UI ==>|"GET /suggest?q="| NORM
-    NORM ==> RING
-    RING ==>|"route key to owner node"| CACHE
-    CACHE ==>|"HIT: cached top-10"| UI
-    CACHE -->|"MISS"| RANK
-    RANK -->|"read top-N"| TRIE
-    RANK -.->|"populate owner node"| CACHE
-    RANK ==>|"return suggestions"| UI
-
-    %% write path — POST /search
-    UI -->|"POST /search"| SH
-    SH --> TREND["trending.record()"]
-    SH --> INC["trie.increment() — live"]
-    SH --> ADD["batch_writer.add()"]
-    SH --> INVAL["cache.invalidate_prefixes()"]
-    INC --> TRIE
-    ADD --> BW
-    INVAL --> CACHE
-    BW -->|"aggregated upsert"| DB
-
-    %% startup
-    DB -.->|"rebuilt on startup"| TRIE
+flowchart LR
+    A(["Browser"]) -->|"GET /suggest?q=prefix"| B["normalize<br/>trim + lowercase"]
+    B --> C{{"consistent-hash<br/>ring"}}
+    C -->|"route prefix<br/>to owner node"| D[("owning cache node<br/>TTL + LRU")]
+    D -->|"HIT"| OUT(["top-10<br/>suggestions"])
+    D -->|"MISS"| E["rank<br/>popularity + recency"]
+    E -->|"read top-N"| F[["Prefix Trie"]]
+    E -.->|"cache result"| D
+    E --> OUT
 
     classDef read fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+    classDef store fill:#ede7f6,stroke:#4527a0,color:#1a1035;
+    class B,C,E read
+    class D,F store
+```
+
+The prefix is routed to exactly one cache node by the ring. A **hit** returns the
+precomputed top-10 immediately; a **miss** ranks completions from the trie,
+caches the result on that node, and returns it. Empty, missing, mixed-case, and
+no-match inputs all return an empty list — never an error.
+
+### Write path — `POST /search`
+
+```mermaid
+flowchart TB
+    A(["Browser"]) -->|"POST /search"| B["/search handler"]
+    B --> C["trending.record()<br/>recency score"]
+    B --> D["trie.increment()<br/>live, in-memory"]
+    B --> E["batch_writer.add()<br/>buffer delta"]
+    B --> F["cache.invalidate_prefixes()"]
+    D --> G[["Prefix Trie"]]
+    F --> H[("cache nodes")]
+    E --> I["BatchWriter<br/>flush by size / interval"]
+    I -->|"aggregated upsert"| J[("SQLite<br/>queries table")]
+
     classDef write fill:#fff3e0,stroke:#e65100,color:#3e2723;
     classDef store fill:#ede7f6,stroke:#4527a0,color:#1a1035;
-    class NORM,RING,RANK read;
-    class SH,TREND,INC,ADD,INVAL,BW write;
-    class TRIE,DB,C0,C1,C2 store;
+    class B,C,D,E,F,I write
+    class G,H,J store
 ```
 
-**Legend:** **bold arrows** = the hot read path (`GET /suggest`); thin arrows =
-the write path (`POST /search`); dotted arrows = asynchronous / startup work
-(cache population, batch flush, trie rebuild). Blue = read-path logic,
-orange = write-path logic, purple = storage.
-
-**Read (`/suggest`):** normalize → ring routes the prefix to its owning cache
-node → **hit** returns the cached top-10; **miss** ranks from the trie, populates
-that node, and returns.
-
-**Write (`/search`):** the handler bumps the trending score, increments the trie
-*live* (so suggestions are instantly fresh), buffers the durable count for the
-next batch flush, and invalidates the affected prefixes in the cache.
-
-<details>
-<summary>Plain-text version (for editors without Mermaid)</summary>
-
-```
-                         Browser / static UI
-              GET /suggest |                 ^  suggestions
-                           v                 |
-   normalize -> consistent-hash ring -> [node-0 | node-1 | node-2]   (TTL + LRU)
-                                              | hit -> return cached top-10
-                                              | miss
-                                              v
-                                     rank (popularity + recency)
-                                              | reads
-                                              v
-                                     Prefix Trie (top-N per node)
-                                              ^
-                          POST /search        | live increment
-   Browser ---------------> /search handler ---+--> trending.record()
-                                              |--> batch_writer.add() -> buffer
-                                              |        -> flush (size/time) -> SQLite
-                                              |--> cache.invalidate_prefixes()
-                                              |
-                       SQLite --- rebuilt on startup ---> Prefix Trie
-```
-</details>
+The handler updates the trie *live* (so suggestions are instantly fresh), bumps
+the recency score, invalidates the affected cached prefixes, and buffers the
+count — the durable SQLite write is batched in the background. It returns
+`{"message": "Searched"}`. On startup the trie is rebuilt from SQLite, the
+durable source of truth.
 
 **Module map** (`app/`):
 
@@ -166,31 +126,6 @@ next batch flush, and invalidates the affected prefixes in the cache.
 
 For the reasoning behind each of these choices — and the alternatives that were
 rejected — see [DESIGN.md](DESIGN.md).
-
----
-
-## How it works
-
-### Read path — `GET /suggest?q=ip`
-1. Normalize the prefix (trim + lowercase) so matching is case-insensitive.
-2. Route the prefix through the consistent-hash ring to its owning cache node.
-3. **Cache hit** → return the precomputed top-10 list immediately.
-4. **Cache miss** → read the prefix's cached completion list straight off the
-   trie node (no subtree scan), apply ranking, store the result on the owning
-   cache node, and return it.
-
-Empty, missing, mixed-case, and no-match inputs are all handled gracefully —
-they return an empty list, never an error.
-
-### Write path — `POST /search {"query": "..."}`
-1. Bump the query's **recency score** (for trending and recency ranking).
-2. **Increment the trie immediately** so suggestions reflect the search right
-   away, even though the durable write is deferred.
-3. **Buffer** the count update for the next batch flush — no synchronous disk write.
-4. **Invalidate** cached suggestion lists for the query's prefixes so stale
-   rankings aren't served.
-
-Returns `{"message": "Searched"}`.
 
 ---
 
