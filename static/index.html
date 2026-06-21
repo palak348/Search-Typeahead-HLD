@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search Typeahead</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="app">
+    <h1>🔎 Search Typeahead</h1>
+    <p class="sub">Type to see suggestions ranked by popularity &amp; recent activity.</p>
+
+    <div class="search-wrap">
+      <div class="search-row">
+        <input
+          id="search"
+          type="text"
+          autocomplete="off"
+          placeholder="Search… (try 'ip', 'java', 'best')"
+          aria-label="Search"
+          aria-expanded="false"
+          aria-controls="suggestions"
+        />
+        <button id="search-btn">Search</button>
+      </div>
+      <!-- Suggestion dropdown; updates as the user types -->
+      <ul id="suggestions" class="suggestions" role="listbox" hidden></ul>
+      <div id="status" class="status" aria-live="polite"></div>
+    </div>
+
+    <section id="result" class="result" hidden>
+      <h2>Search response</h2>
+      <pre id="result-body"></pre>
+    </section>
+
+    <section class="trending">
+      <h2>🔥 Trending searches</h2>
+      <ol id="trending-list" class="trending-list">
+        <li class="muted">No trending data yet — submit a few searches.</li>
+      </ol>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
